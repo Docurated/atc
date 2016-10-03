@@ -6,7 +6,7 @@ import Json.Decode exposing ((:=))
 
 import Concourse
 
-import EventSource
+import Phoenix.Socket
 
 type BuildEvent
   = BuildStatus Concourse.BuildStatus Date
@@ -22,10 +22,8 @@ type BuildEvent
   | BuildError String
 
 type Msg
-  = Opened
-  | Errored
-  | Event (Result String BuildEvent)
-  | End
+  = Event (Result String BuildEvent)
+  | PhoenixMsg (Phoenix.Socket.Msg Msg)
 
 type alias BuildEventEnvelope =
   { event : String
@@ -38,11 +36,15 @@ type alias Origin =
   , id : String
   }
 
+socketEndpoint : String
+socketEndpoint =
+  "ws://localhost:7777/events/websocket"
+
 subscribe : Int -> Sub Msg
 subscribe build =
   EventSource.listen ("/api/v1/builds/" ++ toString build ++ "/events", ["end", "event"]) parseMsg
 
-parseMsg : EventSource.Msg -> Msg
+parseMsg : PhoenixMsg -> Msg
 parseMsg msg =
   case msg of
     EventSource.Event {name, data} ->

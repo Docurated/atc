@@ -17,13 +17,15 @@ import Concourse.BuildResources exposing (empty, fetch)
 import LoadingIndicator
 import StepTree exposing (StepTree)
 
+import Phoenix.Socket
+
 type alias Model =
   { build : Concourse.Build
   , steps : Maybe StepTree.Model
   , errors : Maybe Ansi.Log.Model
   , state : OutputState
-  , eventSourceOpened : Bool
   , events : Sub Msg
+  , eventsSocket : Phoenix.Socket.Socket Msg
   }
 
 type OutputState
@@ -36,6 +38,7 @@ type Msg
   = Noop
   | PlanAndResourcesFetched (Result Http.Error (Concourse.BuildPlan, Concourse.BuildResources))
   | BuildEventsMsg Concourse.BuildEvents.Msg
+  | PhoenixMsg (Phoenix.Socket.Msg Msg)
   | StepTreeMsg StepTree.Msg
 
 type OutMsg
@@ -58,6 +61,7 @@ init build =
       , state = outputState
       , events = Sub.none
       , eventSourceOpened = False
+      , eventsSocket = Phoenix.Socket.init Concourse.BuildEvents.socketEndpoint
       }
 
     fetch =
@@ -75,8 +79,9 @@ update action model =
       (model, Cmd.none, OutNoop)
 
     PlanAndResourcesFetched (Err (Http.BadResponse 404 _)) ->
-      ( { model | events = subscribeToEvents model.build.id }
-      , Cmd.none
+      {eventsSocket, cmd} = subscribeToEvents model.build.id model.eventsSocket
+      ( { model | eventsSocket = eventsSocket }
+      , cmd
       , OutNoop
       )
 
@@ -85,14 +90,15 @@ update action model =
         (model, Cmd.none, OutNoop)
 
     PlanAndResourcesFetched (Ok (plan, resources)) ->
+      {eventsSocket, cmd} = subscribeToEvents model.build.id model.eventsSocket
       ( { model | steps = Just (StepTree.init resources plan)
-                , events = subscribeToEvents model.build.id }
-      , Cmd.none
+                , eventsSocket = eventsSocket }
+      , cmd
       , OutNoop
       )
 
-    BuildEventsMsg action ->
-      handleEventsMsg action model
+    PhoenixMsg action ->
+      handlePhoenixMsg action model
 
     StepTreeMsg action ->
       ( { model | steps = Maybe.map (StepTree.update action) model.steps }
@@ -100,12 +106,21 @@ update action model =
       , OutNoop
       )
 
-handleEventsMsg : Concourse.BuildEvents.Msg -> Model -> (Model, Cmd Msg, OutMsg)
-handleEventsMsg action model =
-  case action of
-    Concourse.BuildEvents.Opened ->
-      ({ model | eventSourceOpened = True }, Cmd.none, OutNoop)
+subscriptions : Model -> Sub Msg
+subscriptions model =
+  Phoenix.Socket.listen model.eventsSocket PhoenixMsg
 
+handlePhoenixMsg : PhoenixMsg -> Model -> (Model, Cmd Msg, OutMsg)
+handlePhoenixMsg action model =
+  let
+    ( eventsSocket, phxCmd ) = Phoenix.Socket.update msg model.eventsSocket
+  in
+      ( { model | eventsSocket = eventsSocket }
+      , Cmd.map PhoenixMsg phxCmd
+      , OutNoop
+      )
+{-
+  case action of
     Concourse.BuildEvents.Errored ->
       if model.eventSourceOpened then
         -- connection could have dropped out of the blue; just let the browser
@@ -124,7 +139,7 @@ handleEventsMsg action model =
 
     Concourse.BuildEvents.End ->
       ({ model | state = StepsComplete, events = Sub.none }, Cmd.none, OutNoop)
-
+-}
 handleEvent : Concourse.BuildEvents.BuildEvent -> Model -> (Model, Cmd Msg, OutMsg)
 handleEvent event model =
   case event of
@@ -255,9 +270,14 @@ fetchBuildPlan buildId =
   Cmd.map PlanAndResourcesFetched << Task.perform Err Ok <|
     Task.map (flip (,) Concourse.BuildResources.empty) (Concourse.BuildPlan.fetch buildId)
 
-subscribeToEvents : Int -> Sub Msg
-subscribeToEvents buildId =
-  Sub.map BuildEventsMsg (Concourse.BuildEvents.subscribe buildId)
+subscribeToEvents : Int -> Phoenix.Socket.Socket -> Phoenix.Socket.Socket PhoenixMsg
+subscribeToEvents buildId socket =
+  channel =
+    Phoenix.Channel.init "build:" ++ (toString buildId)
+  {socket, cmd} = Phoenix.Socket.join channel socket
+  (socket
+  , Cmd.Map PhoenixMsg cmd
+  )
 
 view : Model -> Html Msg
 view {build, steps, errors, state} =

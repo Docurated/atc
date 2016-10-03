@@ -125,6 +125,7 @@ subscriptions model =
 
         Just buildOutput ->
           Sub.map (BuildOutputMsg model.browsingIndex) buildOutput.events
+    , Concourse.BuildOuput.subscriptions model.currentBuild.output
     ]
 
 changeToBuild : Result String Page -> Model -> (Model, Cmd Msg)
