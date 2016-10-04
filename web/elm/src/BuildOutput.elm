@@ -44,10 +44,11 @@ type Msg
   | ChannelOpened String
   | ChannelErrored String
   | ChannelClosed String
-  | BuildEventMsg BuildEvent Json.Encode.Value
+  | BuildEventWrapper BuildEventMsg Json.Encode.Value
 
-type BuildEvent
-  = LogEvent
+type BuildEventMsg
+  = LogMsg
+  | StatusMsg
 
 type OutMsg
   = OutNoop
@@ -58,11 +59,9 @@ type alias Origin =
   , id : String
   }
 
-type alias BuildEventWrapper =
-  { origin : Origin
-  , output : String
-  }
-
+type BuildEvent
+  = Log Origin String
+  | Status Concourse.BuildStatus Date
 
 init : Concourse.Build -> (Model, Cmd Msg)
 init build =
@@ -149,10 +148,10 @@ update action model =
       , OutNoop
       )
 
-    BuildEventMsg eventType raw ->
-      case Json.Decode.decodeValue eventsDecoder raw of
+    BuildEventWrapper eventType raw ->
+      case decodeEvent eventType raw of
         Ok event ->
-          handleEvent eventType event model
+          handleEvent event model
         Err error ->
           Debug.log error
           (model, Cmd.none, OutNoop)
@@ -161,25 +160,51 @@ subscriptions : Model -> Sub Msg
 subscriptions model =
   Phoenix.Socket.listen model.eventsSocket PhoenixMsg
 
+dateFromSeconds : Float -> Date
+dateFromSeconds = Date.fromTime << ((*) 1000)
+
 decodeOrigin : Json.Decode.Decoder Origin
 decodeOrigin =
   Json.Decode.object2 Origin
     (Json.Decode.map (Maybe.withDefault "") << Json.Decode.maybe <| "source" := Json.Decode.string)
     ("id" := Json.Decode.string)
 
-eventsDecoder : Json.Decode.Decoder BuildEventWrapper
-eventsDecoder =
-  Json.Decode.object2 BuildEventWrapper
-    ("origin" := decodeOrigin)
-    ("payload" := Json.Decode.string)
+decodeEvent : BuildEventMsg -> Json.Encode.Value -> Result String BuildEvent
+decodeEvent msg raw =
+  let
+    decoder = case msg of
+      LogMsg ->
+        Json.Decode.object2 Log
+          ("origin" := decodeOrigin)
+          ("output" := Json.Decode.string)
+      StatusMsg ->
+        Json.Decode.object2 Status
+          ("status" := Concourse.decodeBuildStatus)
+          ("time" := Json.Decode.map dateFromSeconds Json.Decode.float)
+  in
+    Json.Decode.decodeValue decoder raw
 
-handleEvent : BuildEvent -> BuildEventWrapper -> Model -> (Model, Cmd Msg, OutMsg)
-handleEvent eventType event model =
-  case eventType of
-    LogEvent ->
-      ( updateStep event.origin.id (setRunning << appendStepLog event.output) model
+
+
+handleEvent : BuildEvent -> Model -> (Model, Cmd Msg, OutMsg)
+handleEvent event model =
+  case event of
+    Log origin output ->
+      ( updateStep origin.id (setRunning << appendStepLog output) model
       , Cmd.none
       , OutNoop
+      )
+
+    Status status date ->
+      ( { model
+        | steps =
+            if not <| Concourse.BuildStatus.isRunning status then
+              Maybe.map (StepTree.update StepTree.Finished) model.steps
+            else
+              model.steps
+        }
+      , Cmd.none
+      , OutBuildStatus status date
       )
 
       {-
@@ -229,18 +254,6 @@ handleEvent eventType event model =
       ( updateStep event.origin.id (finishStep exitStatus << setResourceInfo version metadata) model
       , Cmd.none
       , OutNoop
-      )
-
-    Concourse.BuildEvents.BuildStatus status date ->
-      ( { model
-        | steps =
-            if not <| Concourse.BuildStatus.isRunning status then
-              Maybe.map (StepTree.update StepTree.Finished) model.steps
-            else
-              model.steps
-        }
-      , Cmd.none
-      , OutBuildStatus status date
       )
 
     Concourse.BuildEvents.BuildError message ->
@@ -319,7 +332,9 @@ subscribeToEvents buildId socket =
         |> Phoenix.Channel.onClose (always (ChannelClosed channelName))
         |> Phoenix.Channel.onError (always (ChannelErrored channelName))
     (socket, cmd) =
-      Phoenix.Socket.on "log" channelName (BuildEventMsg LogEvent) socket
+      socket
+        |> Phoenix.Socket.on "log" channelName (BuildEventWrapper LogMsg)
+        |> Phoenix.Socket.on "status" channelName (BuildEventWrapper StatusMsg)
         |> Phoenix.Socket.join channel
   in
     (socket
