@@ -2,6 +2,7 @@ module BuildOutput exposing (init, update, view, subscriptions, Model, Msg, OutM
 
 import Ansi.Log
 import Date exposing (Date)
+import Dict exposing (Dict)
 import Html exposing (Html)
 import Html.App
 import Html.Attributes exposing (action, class, classList, href, id, method, title)
@@ -49,6 +50,15 @@ type Msg
 type BuildEventMsg
   = LogMsg
   | StatusMsg
+  | ErrorMsg
+  | InitializeTaskMsg
+  | StartTaskMsg
+  | FinishTaskMsg
+  | InitializeGetMsg
+  | FinishGetMsg
+  | InitializePutMsg
+  | FinishPutMsg
+  | BuildErrorMsg
 
 type OutMsg
   = OutNoop
@@ -60,8 +70,17 @@ type alias Origin =
   }
 
 type BuildEvent
-  = Log Origin String
-  | Status Concourse.BuildStatus Date
+  = BuildStatus Concourse.BuildStatus Date
+  | InitializeTask Origin
+  | StartTask Origin
+  | FinishTask Origin Int
+  | InitializeGet Origin
+  | FinishGet Origin Int Concourse.Version Concourse.Metadata
+  | InitializePut Origin
+  | FinishPut Origin Int Concourse.Version Concourse.Metadata
+  | Log Origin String
+  | Error Origin String
+  | BuildError String
 
 init : Concourse.Build -> (Model, Cmd Msg)
 init build =
@@ -169,6 +188,14 @@ decodeOrigin =
     (Json.Decode.map (Maybe.withDefault "") << Json.Decode.maybe <| "source" := Json.Decode.string)
     ("id" := Json.Decode.string)
 
+decodeFinishResource : (Origin -> Int -> Concourse.Version -> Concourse.Metadata -> a) -> Json.Decode.Decoder a
+decodeFinishResource cons =
+  Json.Decode.object4 cons
+    ("origin" := decodeOrigin)
+    ("exit_status" := Json.Decode.int)
+    (Json.Decode.map (Maybe.withDefault Dict.empty) << Json.Decode.maybe <| "version" := Concourse.decodeVersion)
+    (Json.Decode.map (Maybe.withDefault []) << Json.Decode.maybe <| "metadata" := Concourse.decodeMetadata)
+
 decodeEvent : BuildEventMsg -> Json.Encode.Value -> Result String BuildEvent
 decodeEvent msg raw =
   let
@@ -177,10 +204,38 @@ decodeEvent msg raw =
         Json.Decode.object2 Log
           ("origin" := decodeOrigin)
           ("output" := Json.Decode.string)
+
       StatusMsg ->
-        Json.Decode.object2 Status
+        Json.Decode.object2 BuildStatus
           ("status" := Concourse.decodeBuildStatus)
           ("time" := Json.Decode.map dateFromSeconds Json.Decode.float)
+
+      ErrorMsg ->
+        Json.Decode.object2 Error ("origin" := decodeOrigin) ("message" := Json.Decode.string)
+
+      BuildErrorMsg ->
+        Json.Decode.object1 BuildError ("message" := Json.Decode.string)
+
+      InitializeTaskMsg ->
+        Json.Decode.object1 InitializeTask ("origin" := decodeOrigin)
+
+      StartTaskMsg ->
+        Json.Decode.object1 StartTask ("origin" := decodeOrigin)
+
+      FinishTaskMsg ->
+        Json.Decode.object2 FinishTask ("origin" := decodeOrigin) ("exit_status" := Json.Decode.int)
+
+      InitializeGetMsg ->
+        Json.Decode.object1 InitializeGet ("origin" := decodeOrigin)
+
+      FinishGetMsg ->
+        decodeFinishResource FinishGet
+
+      InitializePutMsg ->
+        Json.Decode.object1 InitializePut ("origin" := decodeOrigin)
+
+      FinishPutMsg ->
+        decodeFinishResource FinishPut
   in
     Json.Decode.decodeValue decoder raw
 
@@ -195,7 +250,7 @@ handleEvent event model =
       , OutNoop
       )
 
-    Status status date ->
+    BuildStatus status date ->
       ( { model
         | steps =
             if not <| Concourse.BuildStatus.isRunning status then
@@ -207,56 +262,55 @@ handleEvent event model =
       , OutBuildStatus status date
       )
 
-      {-
-    Concourse.BuildEvents.Error event.origin message ->
-      ( updateStep event.origin.id (setStepError message) model
+    Error origin message ->
+      ( updateStep origin.id (setStepError message) model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.InitializeTask event.origin ->
-      ( updateStep event.origin.id setRunning model
+    InitializeTask origin ->
+      ( updateStep origin.id setRunning model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.StartTask event.origin ->
-      ( updateStep event.origin.id setRunning model
+    StartTask origin ->
+      ( updateStep origin.id setRunning model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.FinishTask event.origin exitStatus ->
-      ( updateStep event.origin.id (finishStep exitStatus) model
+    FinishTask origin exitStatus ->
+      ( updateStep origin.id (finishStep exitStatus) model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.InitializeGet event.origin ->
-      ( updateStep event.origin.id setRunning model
+    InitializeGet origin ->
+      ( updateStep origin.id setRunning model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.FinishGet event.origin exitStatus version metadata ->
-      ( updateStep event.origin.id (finishStep exitStatus << setResourceInfo version metadata) model
+    FinishGet origin exitStatus version metadata ->
+      ( updateStep origin.id (finishStep exitStatus << setResourceInfo version metadata) model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.InitializePut event.origin ->
-      ( updateStep event.origin.id setRunning model
+    InitializePut origin ->
+      ( updateStep origin.id setRunning model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.FinishPut event.origin exitStatus version metadata ->
-      ( updateStep event.origin.id (finishStep exitStatus << setResourceInfo version metadata) model
+    FinishPut origin exitStatus version metadata ->
+      ( updateStep origin.id (finishStep exitStatus << setResourceInfo version metadata) model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.BuildError message ->
+    BuildError message ->
       ( { model |
           errors =
             Just <|
@@ -266,7 +320,7 @@ handleEvent event model =
       , Cmd.none
       , OutNoop
       )
--}
+
 initSocket : Phoenix.Socket.Socket Msg
 initSocket =
   Phoenix.Socket.init "ws://localhost:7777/events/websocket"
@@ -335,6 +389,15 @@ subscribeToEvents buildId socket =
       socket
         |> Phoenix.Socket.on "log" channelName (BuildEventWrapper LogMsg)
         |> Phoenix.Socket.on "status" channelName (BuildEventWrapper StatusMsg)
+        |> Phoenix.Socket.on "error" channelName (BuildEventWrapper ErrorMsg)
+        |> Phoenix.Socket.on "initialize_task" channelName (BuildEventWrapper InitializeTaskMsg)
+        |> Phoenix.Socket.on "start_task" channelName (BuildEventWrapper StartTaskMsg)
+        |> Phoenix.Socket.on "finish_task" channelName (BuildEventWrapper FinishTaskMsg)
+        |> Phoenix.Socket.on "initialize_get" channelName (BuildEventWrapper InitializeGetMsg)
+        |> Phoenix.Socket.on "finish_get" channelName (BuildEventWrapper FinishGetMsg)
+        |> Phoenix.Socket.on "initialize_put" channelName (BuildEventWrapper InitializePutMsg)
+        |> Phoenix.Socket.on "finish_put" channelName (BuildEventWrapper FinishPutMsg)
+        |> Phoenix.Socket.on "build_error" channelName (BuildEventWrapper BuildErrorMsg)
         |> Phoenix.Socket.join channel
   in
     (socket
