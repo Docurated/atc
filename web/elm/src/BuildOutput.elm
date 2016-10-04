@@ -1,4 +1,4 @@
-module BuildOutput exposing (init, update, view, Model, Msg, OutMsg(..))
+module BuildOutput exposing (init, update, view, subscriptions, Model, Msg, OutMsg(..))
 
 import Ansi.Log
 import Date exposing (Date)
@@ -6,17 +6,19 @@ import Html exposing (Html)
 import Html.App
 import Html.Attributes exposing (action, class, classList, href, id, method, title)
 import Http
+import Json.Encode
+import Json.Decode exposing ((:=))
 import Task exposing (Task)
 
 import Concourse
 import Concourse.Build
 import Concourse.BuildPlan
-import Concourse.BuildEvents
 import Concourse.BuildStatus
 import Concourse.BuildResources exposing (empty, fetch)
 import LoadingIndicator
 import StepTree exposing (StepTree)
 
+import Phoenix.Channel
 import Phoenix.Socket
 
 type alias Model =
@@ -24,7 +26,7 @@ type alias Model =
   , steps : Maybe StepTree.Model
   , errors : Maybe Ansi.Log.Model
   , state : OutputState
-  , events : Sub Msg
+  , eventSourceOpened : Bool
   , eventsSocket : Phoenix.Socket.Socket Msg
   }
 
@@ -37,13 +39,30 @@ type OutputState
 type Msg
   = Noop
   | PlanAndResourcesFetched (Result Http.Error (Concourse.BuildPlan, Concourse.BuildResources))
-  | BuildEventsMsg Concourse.BuildEvents.Msg
   | PhoenixMsg (Phoenix.Socket.Msg Msg)
   | StepTreeMsg StepTree.Msg
+  | ChannelOpened String
+  | ChannelErrored String
+  | ChannelClosed String
+  | BuildEventMsg BuildEvent Json.Encode.Value
+
+type BuildEvent
+  = LogEvent
 
 type OutMsg
   = OutNoop
   | OutBuildStatus Concourse.BuildStatus Date
+
+type alias Origin =
+  { source : String
+  , id : String
+  }
+
+type alias BuildEventWrapper =
+  { origin : Origin
+  , output : String
+  }
+
 
 init : Concourse.Build -> (Model, Cmd Msg)
 init build =
@@ -59,9 +78,8 @@ init build =
       , steps = Nothing
       , errors = Nothing
       , state = outputState
-      , events = Sub.none
       , eventSourceOpened = False
-      , eventsSocket = Phoenix.Socket.init Concourse.BuildEvents.socketEndpoint
+      , eventsSocket = initSocket
       }
 
     fetch =
@@ -79,49 +97,40 @@ update action model =
       (model, Cmd.none, OutNoop)
 
     PlanAndResourcesFetched (Err (Http.BadResponse 404 _)) ->
-      {eventsSocket, cmd} = subscribeToEvents model.build.id model.eventsSocket
-      ( { model | eventsSocket = eventsSocket }
-      , cmd
-      , OutNoop
-      )
+      let
+        (eventsSocket, cmd) = subscribeToEvents model.build.id model.eventsSocket
+      in
+        ( { model | eventsSocket = eventsSocket }
+        , cmd
+        , OutNoop
+        )
 
     PlanAndResourcesFetched (Err err) ->
       Debug.log ("failed to fetch plan: " ++ toString err) <|
         (model, Cmd.none, OutNoop)
 
     PlanAndResourcesFetched (Ok (plan, resources)) ->
-      {eventsSocket, cmd} = subscribeToEvents model.build.id model.eventsSocket
-      ( { model | steps = Just (StepTree.init resources plan)
-                , eventsSocket = eventsSocket }
-      , cmd
-      , OutNoop
-      )
+      let
+        (eventsSocket, cmd) = subscribeToEvents model.build.id model.eventsSocket
+      in
+        ( { model | steps = Just (StepTree.init resources plan), eventsSocket = eventsSocket }
+        , cmd
+        , OutNoop
+        )
 
-    PhoenixMsg action ->
-      handlePhoenixMsg action model
+    PhoenixMsg msg ->
+      let
+        ( eventsSocket, phxCmd ) = Phoenix.Socket.update msg model.eventsSocket
+      in
+        ( { model | eventsSocket = eventsSocket }
+        , Cmd.map PhoenixMsg phxCmd
+        , OutNoop
+        )
 
-    StepTreeMsg action ->
-      ( { model | steps = Maybe.map (StepTree.update action) model.steps }
-      , Cmd.none
-      , OutNoop
-      )
+    ChannelOpened channel ->
+      ({ model | eventSourceOpened = True }, Cmd.none, OutNoop)
 
-subscriptions : Model -> Sub Msg
-subscriptions model =
-  Phoenix.Socket.listen model.eventsSocket PhoenixMsg
-
-handlePhoenixMsg : PhoenixMsg -> Model -> (Model, Cmd Msg, OutMsg)
-handlePhoenixMsg action model =
-  let
-    ( eventsSocket, phxCmd ) = Phoenix.Socket.update msg model.eventsSocket
-  in
-      ( { model | eventsSocket = eventsSocket }
-      , Cmd.map PhoenixMsg phxCmd
-      , OutNoop
-      )
-{-
-  case action of
-    Concourse.BuildEvents.Errored ->
+    ChannelErrored channel ->
       if model.eventSourceOpened then
         -- connection could have dropped out of the blue; just let the browser
         -- handle reconnecting
@@ -131,68 +140,93 @@ handlePhoenixMsg action model =
         -- really tell
         ({ model | state = LoginRequired }, Cmd.none, OutNoop)
 
-    Concourse.BuildEvents.Event (Ok event) ->
-      handleEvent event model
+    ChannelClosed channel ->
+      ({ model | state = StepsComplete }, Cmd.none, OutNoop)
 
-    Concourse.BuildEvents.Event (Err err) ->
-      (model, Debug.log err Cmd.none, OutNoop)
-
-    Concourse.BuildEvents.End ->
-      ({ model | state = StepsComplete, events = Sub.none }, Cmd.none, OutNoop)
--}
-handleEvent : Concourse.BuildEvents.BuildEvent -> Model -> (Model, Cmd Msg, OutMsg)
-handleEvent event model =
-  case event of
-    Concourse.BuildEvents.Log origin output ->
-      ( updateStep origin.id (setRunning << appendStepLog output) model
+    StepTreeMsg action ->
+      ( { model | steps = Maybe.map (StepTree.update action) model.steps }
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.Error origin message ->
-      ( updateStep origin.id (setStepError message) model
+    BuildEventMsg eventType raw ->
+      case Json.Decode.decodeValue eventsDecoder raw of
+        Ok event ->
+          handleEvent eventType event model
+        Err error ->
+          Debug.log error
+          (model, Cmd.none, OutNoop)
+
+subscriptions : Model -> Sub Msg
+subscriptions model =
+  Phoenix.Socket.listen model.eventsSocket PhoenixMsg
+
+decodeOrigin : Json.Decode.Decoder Origin
+decodeOrigin =
+  Json.Decode.object2 Origin
+    (Json.Decode.map (Maybe.withDefault "") << Json.Decode.maybe <| "source" := Json.Decode.string)
+    ("id" := Json.Decode.string)
+
+eventsDecoder : Json.Decode.Decoder BuildEventWrapper
+eventsDecoder =
+  Json.Decode.object2 BuildEventWrapper
+    ("origin" := decodeOrigin)
+    ("payload" := Json.Decode.string)
+
+handleEvent : BuildEvent -> BuildEventWrapper -> Model -> (Model, Cmd Msg, OutMsg)
+handleEvent eventType event model =
+  case eventType of
+    LogEvent ->
+      ( updateStep event.origin.id (setRunning << appendStepLog event.output) model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.InitializeTask origin ->
-      ( updateStep origin.id setRunning model
+      {-
+    Concourse.BuildEvents.Error event.origin message ->
+      ( updateStep event.origin.id (setStepError message) model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.StartTask origin ->
-      ( updateStep origin.id setRunning model
+    Concourse.BuildEvents.InitializeTask event.origin ->
+      ( updateStep event.origin.id setRunning model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.FinishTask origin exitStatus ->
-      ( updateStep origin.id (finishStep exitStatus) model
+    Concourse.BuildEvents.StartTask event.origin ->
+      ( updateStep event.origin.id setRunning model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.InitializeGet origin ->
-      ( updateStep origin.id setRunning model
+    Concourse.BuildEvents.FinishTask event.origin exitStatus ->
+      ( updateStep event.origin.id (finishStep exitStatus) model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.FinishGet origin exitStatus version metadata ->
-      ( updateStep origin.id (finishStep exitStatus << setResourceInfo version metadata) model
+    Concourse.BuildEvents.InitializeGet event.origin ->
+      ( updateStep event.origin.id setRunning model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.InitializePut origin ->
-      ( updateStep origin.id setRunning model
+    Concourse.BuildEvents.FinishGet event.origin exitStatus version metadata ->
+      ( updateStep event.origin.id (finishStep exitStatus << setResourceInfo version metadata) model
       , Cmd.none
       , OutNoop
       )
 
-    Concourse.BuildEvents.FinishPut origin exitStatus version metadata ->
-      ( updateStep origin.id (finishStep exitStatus << setResourceInfo version metadata) model
+    Concourse.BuildEvents.InitializePut event.origin ->
+      ( updateStep event.origin.id setRunning model
+      , Cmd.none
+      , OutNoop
+      )
+
+    Concourse.BuildEvents.FinishPut event.origin exitStatus version metadata ->
+      ( updateStep event.origin.id (finishStep exitStatus << setResourceInfo version metadata) model
       , Cmd.none
       , OutNoop
       )
@@ -219,6 +253,11 @@ handleEvent event model =
       , Cmd.none
       , OutNoop
       )
+-}
+initSocket : Phoenix.Socket.Socket Msg
+initSocket =
+  Phoenix.Socket.init "ws://localhost:7777/events/websocket"
+    |> Phoenix.Socket.withDebug
 
 updateStep : StepTree.StepID -> (StepTree -> StepTree) -> Model -> Model
 updateStep id update model =
@@ -270,14 +309,22 @@ fetchBuildPlan buildId =
   Cmd.map PlanAndResourcesFetched << Task.perform Err Ok <|
     Task.map (flip (,) Concourse.BuildResources.empty) (Concourse.BuildPlan.fetch buildId)
 
-subscribeToEvents : Int -> Phoenix.Socket.Socket -> Phoenix.Socket.Socket PhoenixMsg
+subscribeToEvents : Int -> Phoenix.Socket.Socket Msg -> (Phoenix.Socket.Socket Msg, Cmd Msg)
 subscribeToEvents buildId socket =
-  channel =
-    Phoenix.Channel.init "build:" ++ (toString buildId)
-  {socket, cmd} = Phoenix.Socket.join channel socket
-  (socket
-  , Cmd.Map PhoenixMsg cmd
-  )
+  let
+    channelName = "build:" ++ (toString buildId)
+    channel =
+      Phoenix.Channel.init channelName
+        |> Phoenix.Channel.onJoin (always (ChannelOpened channelName))
+        |> Phoenix.Channel.onClose (always (ChannelClosed channelName))
+        |> Phoenix.Channel.onError (always (ChannelErrored channelName))
+    (socket, cmd) =
+      Phoenix.Socket.on "log" channelName (BuildEventMsg LogEvent) socket
+        |> Phoenix.Socket.join channel
+  in
+    (socket
+    , Cmd.map PhoenixMsg cmd
+    )
 
 view : Model -> Html Msg
 view {build, steps, errors, state} =
