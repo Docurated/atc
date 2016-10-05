@@ -124,7 +124,11 @@ subscriptions model =
           Sub.none
 
         Just buildOutput ->
-          Sub.map (BuildOutputMsg model.browsingIndex) buildOutput.events
+          Sub.batch
+          [ Sub.map (BuildOutputMsg model.browsingIndex) buildOutput.events
+          , Sub.map (BuildOutputMsg model.browsingIndex) (BuildOutput.subscriptions buildOutput)
+          ]
+
     ]
 
 changeToBuild : Result String Page -> Model -> (Model, Cmd Msg)

@@ -1,4 +1,4 @@
-module BuildOutput exposing (init, update, view, Model, Msg, OutMsg(..))
+module BuildOutput exposing (init, update, view, subscriptions, Model, Msg, OutMsg(..))
 
 import Ansi.Log
 import Date exposing (Date)
@@ -6,7 +6,12 @@ import Html exposing (Html)
 import Html.App
 import Html.Attributes exposing (action, class, classList, href, id, method, title)
 import Http
+import Json.Decode exposing ((:=))
+import Json.Encode
 import Task exposing (Task)
+
+import Phoenix.Channel
+import Phoenix.Socket
 
 import Concourse
 import Concourse.Build
@@ -24,6 +29,7 @@ type alias Model =
   , state : OutputState
   , eventSourceOpened : Bool
   , events : Sub Msg
+  , socket : Phoenix.Socket.Socket Msg
   }
 
 type OutputState
@@ -37,6 +43,11 @@ type Msg
   | PlanAndResourcesFetched (Result Http.Error (Concourse.BuildPlan, Concourse.BuildResources))
   | BuildEventsMsg Concourse.BuildEvents.Msg
   | StepTreeMsg StepTree.Msg
+  | PhoenixMsg (Phoenix.Socket.Msg Msg)
+  | EstateMsgWrapper EstateMsg Json.Encode.Value
+
+type EstateMsg
+  = LogMsg
 
 type OutMsg
   = OutNoop
@@ -58,6 +69,7 @@ init build =
       , state = outputState
       , events = Sub.none
       , eventSourceOpened = False
+      , socket = initSocket
       }
 
     fetch =
@@ -75,21 +87,28 @@ update action model =
       (model, Cmd.none, OutNoop)
 
     PlanAndResourcesFetched (Err (Http.BadResponse 404 _)) ->
-      ( { model | events = subscribeToEvents model.build.id }
-      , Cmd.none
-      , OutNoop
-      )
+      let
+        (events, socket, cmd) = subscribeToEvents model.build.id model.socket
+      in
+        ( { model | events = events, socket = socket }
+        , cmd
+        , OutNoop
+        )
 
     PlanAndResourcesFetched (Err err) ->
       Debug.log ("failed to fetch plan: " ++ toString err) <|
         (model, Cmd.none, OutNoop)
 
     PlanAndResourcesFetched (Ok (plan, resources)) ->
-      ( { model | steps = Just (StepTree.init resources plan)
-                , events = subscribeToEvents model.build.id }
-      , Cmd.none
-      , OutNoop
-      )
+      let
+        (events, socket, cmd) = subscribeToEvents model.build.id model.socket
+      in
+        ( { model | steps = Just (StepTree.init resources plan)
+                  , events = events
+                  , socket = socket}
+        , cmd
+        , OutNoop
+        )
 
     BuildEventsMsg action ->
       handleEventsMsg action model
@@ -99,6 +118,38 @@ update action model =
       , Cmd.none
       , OutNoop
       )
+
+    PhoenixMsg msg ->
+      let
+        ( socket, cmd ) = Phoenix.Socket.update msg model.socket
+      in
+        ( { model | socket = socket }
+        , Cmd.map PhoenixMsg cmd
+        , OutNoop
+        )
+
+    EstateMsgWrapper msg raw ->
+      case decodeEstateEvent msg raw of
+        Ok event ->
+          handleEvent event model
+        Err error ->
+          Debug.log error
+          (model, Cmd.none, OutNoop)
+
+subscriptions : Model -> Sub Msg
+subscriptions model =
+  Phoenix.Socket.listen model.socket PhoenixMsg
+
+decodeEstateEvent : EstateMsg -> Json.Encode.Value -> Result String Concourse.BuildEvents.BuildEvent
+decodeEstateEvent msg raw =
+  let
+    decoder = case msg of
+      LogMsg ->
+        Json.Decode.object2 Concourse.BuildEvents.Log
+          ("origin" := Concourse.BuildEvents.decodeOrigin)
+          ("output" := Json.Decode.string)
+  in
+    Json.Decode.decodeValue decoder raw
 
 handleEventsMsg : Concourse.BuildEvents.Msg -> Model -> (Model, Cmd Msg, OutMsg)
 handleEventsMsg action model =
@@ -205,6 +256,11 @@ handleEvent event model =
       , OutNoop
       )
 
+initSocket : Phoenix.Socket.Socket Msg
+initSocket =
+  Phoenix.Socket.init "ws://localhost:7777/events/websocket"
+    |> Phoenix.Socket.withDebug
+
 updateStep : StepTree.StepID -> (StepTree -> StepTree) -> Model -> Model
 updateStep id update model =
   { model | steps = Maybe.map (StepTree.updateAt id update) model.steps }
@@ -255,9 +311,21 @@ fetchBuildPlan buildId =
   Cmd.map PlanAndResourcesFetched << Task.perform Err Ok <|
     Task.map (flip (,) Concourse.BuildResources.empty) (Concourse.BuildPlan.fetch buildId)
 
-subscribeToEvents : Int -> Sub Msg
-subscribeToEvents buildId =
-  Sub.map BuildEventsMsg (Concourse.BuildEvents.subscribe buildId)
+subscribeToEvents : Int -> Phoenix.Socket.Socket Msg -> (Sub Msg, Phoenix.Socket.Socket Msg, Cmd Msg)
+subscribeToEvents buildId socket =
+  let
+    channelName = "build:" ++ (toString buildId)
+    channel = Phoenix.Channel.init channelName
+    (socket, cmd) =
+      socket
+        |> Phoenix.Socket.on "log" channelName (EstateMsgWrapper LogMsg)
+        |> Phoenix.Socket.join channel
+  in
+    ( Sub.map BuildEventsMsg (Concourse.BuildEvents.subscribe buildId)
+    , socket
+    , Cmd.map PhoenixMsg cmd
+    )
+
 
 view : Model -> Html Msg
 view {build, steps, errors, state} =
